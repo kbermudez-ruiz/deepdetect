@@ -26,6 +26,7 @@
 #include "caffemodel.h"
 #include "caffe/caffe.hpp"
 #include "caffe/layers/memory_data_layer.hpp"
+#include "caffe/layers/memory_sparse_data_layer.hpp"
 
 using caffe::Blob;
 
@@ -65,33 +66,35 @@ namespace dd
      * \brief configure an MLP template
      * @param ad the template data object
      * @param regression whether the net is a regressor
+     * @param sparse whether the inputs are sparse
      * @param cnclasses the number of output classes, if any
      * @param net_param the training net object
      * @param deploy_net_param the deploy net object
      */
-    static void configure_mlp_template(const APIData &ad,
-				       const bool &regression,
-				       const int &targets,
-				       const int &cnclasses,
-				       caffe::NetParameter &net_param,
-				       caffe::NetParameter &deploy_net_param);
+      void configure_mlp_template(const APIData &ad,
+				  const TInputConnectorStrategy &inputc,
+				  caffe::NetParameter &net_param,
+				  caffe::NetParameter &dnet_param);
+
+
+      void configure_convnet_template(const APIData &ad,
+				      const TInputConnectorStrategy &inputc,
+				      caffe::NetParameter &net_param,
+				      caffe::NetParameter &dnet_param);
+      
+      void configure_resnet_template(const APIData &ad,
+				     const TInputConnectorStrategy &inputc,
+				     caffe::NetParameter &net_param,
+				     caffe::NetParameter &dnet_param);
 
     /**
-     * \brief configure a convnet template
+     * \brief configure noise data augmentation in training template
      * @param ad the template data object
-     * @param regression whether the net is a regressor
-     * @param cnclasses the number of output classes, if any
-     * @param net_param the training net object
-     * @param deploy_net_param the deploy net object
+     * @param net_param the trainng net object
      */
-    static void configure_convnet_template(const APIData &ad,
-					   const bool &regression,
-					   const int &targets,
-					   const int &cnclasses,
-					   const TInputConnectorStrategy &inputc,
-					   caffe::NetParameter &net_param,
-					   caffe::NetParameter &deploy_net_param);
-      
+    static void configure_noise_and_distort(const APIData &ad,
+					    caffe::NetParameter &net_param);
+
     /**
      * \brief creates neural net instance based on model
      * @return 0 if OK, 2, if missing 'deploy' file, 1 otherwise
@@ -130,7 +133,7 @@ namespace dd
     //TODO: status ?
 
     /*- local functions -*/
-     /**
+      /**
       * \brief test net
       * @param ad root data object
       * @param inputc input connector
@@ -177,10 +180,14 @@ namespace dd
        *                 at service creation
        * @param deploy_file the deploy file, same remark as net_file
        * @param inputc the current input constructor that holds the training data
+       * @param has_class_weights whether training uses class weights
+       * @param ignore_label label to be ignored, -1 otherwise
        */
       void update_protofile_net(const std::string &net_file,
 				const std::string &deploy_file,
-				const TInputConnectorStrategy &inputc);
+				const TInputConnectorStrategy &inputc,
+				const bool &has_class_weights,
+				const int &ignore_label);
 
     private:
       void update_protofile_classes(caffe::NetParameter &net_param);
@@ -193,17 +200,28 @@ namespace dd
 			  int &batch_size,
 			  int &test_batch_size,
 			  int &test_iter);
+
+      void set_gpuid(const APIData &ad);
+
+      void model_complexity(long int &flops,
+			    long int &params);
       
     public:
       caffe::Net<float> *_net = nullptr; /**< neural net. */
       bool _gpu = false; /**< whether to use GPU. */
-      int _gpuid = 0; /**< GPU id. */
+      std::vector<int> _gpuid = {0}; /**< GPU id. */
       int _nclasses = 0; /**< required, as difficult to acquire from Caffe's internals. */
       bool _regression = false; /**< whether the net acts as a regressor. */
       int _ntargets = 0; /**< number of classification or regression targets. */
+      bool _autoencoder = false; /**< whether an autoencoder. */
       std::mutex _net_mutex; /**< mutex around net, e.g. no concurrent predict calls as net is not re-instantiated. Use batches instead. */
+      long int _flops = 0;  /**< model flops. */
+      long int _params = 0;  /**< number of parameters in the model. */
+      int _crop_size = -1; /**< cropping is part of Caffe transforms in input layers, storing here. */
+      caffe::P2PSync<float> *_sync = nullptr;
+      std::vector<boost::shared_ptr<caffe::P2PSync<float>>> _syncs;
     };
-  
+
 }
 
 #endif

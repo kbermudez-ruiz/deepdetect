@@ -62,7 +62,9 @@ namespace dd
 	}
       else if (fileops::file_exists(uri,dir))
 	{
-	  if (dir)
+	  if (fileops::is_db(uri))
+	    return _ctype.read_db(uri); // XXX: db can acutally be a dir (e.g. lmdb)
+	  else if (dir)
 	    return _ctype.read_dir(uri);
 	  else return _ctype.read_file(uri);
 	}
@@ -109,6 +111,8 @@ namespace dd
   {
   public:
     InputConnectorStrategy() {}
+    InputConnectorStrategy(const InputConnectorStrategy &i)
+      :_model_repo(i._model_repo) {}
     ~InputConnectorStrategy() {}
     
     /**
@@ -172,6 +176,7 @@ namespace dd
     
     bool _train = false; /**< whether in train or predict mode. */
     std::vector<std::string> _uris;
+    std::string _model_repo; /**< model repository, useful when connector needs to read from saved data (e.g. vocabulary). */
   };
   
 }

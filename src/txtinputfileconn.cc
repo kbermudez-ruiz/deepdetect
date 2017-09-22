@@ -39,7 +39,7 @@ namespace dd
     std::ifstream txt_file(fname);
     if (!txt_file.is_open())
       {
-	std::cerr << "cannot open file\n";
+	LOG(ERROR) << "cannot open file=" << fname;
 	throw InputConnectorBadParamException("cannot open file " + fname);
       }
     std::stringstream buffer;
@@ -48,6 +48,12 @@ namespace dd
     return 0;
   }
 
+  int DDTxt::read_db(const std::string &fname)
+    {
+      _ctfc->_db_fname = fname;
+      return 0;
+    }
+  
   int DDTxt::read_mem(const std::string &content)
   {
     if (!_ctfc)
@@ -65,28 +71,68 @@ namespace dd
     std::unordered_set<std::string> subdirs;
     if (fileops::list_directory(dir,false,true,subdirs))
       throw InputConnectorBadParamException("failed reading text subdirectories in data directory " + dir);
-    std::cerr << "list subdirs size=" << subdirs.size() << std::endl;
+    LOG(INFO) << "txtinputfileconn: list subdirs size=" << subdirs.size();
     
     // list files and classes
+    bool test_dir = false;
     std::vector<std::pair<std::string,int>> lfiles; // labeled files
     std::unordered_map<int,std::string> hcorresp; // correspondence class number / class name
-    if (_ctfc->_train)
+    std::unordered_map<std::string,int> hcorresp_r; // reverse correspondence for test set.
+    if (!subdirs.empty())
       {
+	++_ctfc->_dirs; // this is a directory containing classes info.
+	if (_ctfc->_dirs >= 2)
+	  {
+	    test_dir = true;
+	    std::ifstream correspf(_ctfc->_model_repo + "/" + _ctfc->_correspname,std::ios::binary);
+	    if (!correspf.is_open())
+	      {
+		std::string err_msg = "Failed opening corresp file before reading txt test data directory";;
+		LOG(ERROR) << err_msg;
+		throw InputConnectorInternalException(err_msg);
+	      }
+	    std::string line;
+	    while(std::getline(correspf,line))
+	      {
+		std::vector<std::string> vstr = dd_utils::split(line,' ');
+		hcorresp_r.insert(std::pair<std::string,int>(vstr.at(1),std::atoi(vstr.at(0).c_str())));
+	      }
+	  }
 	int cl = 0;
 	auto uit = subdirs.begin();
 	while(uit!=subdirs.end())
 	  {
 	    std::unordered_set<std::string> subdir_files;
 	    if (fileops::list_directory((*uit),true,false,subdir_files))
-	      throw InputConnectorBadParamException("failed reading image data sub-directory " + (*uit));
-	    hcorresp.insert(std::pair<int,std::string>(cl,dd_utils::split((*uit),'/').back()));
+	      throw InputConnectorBadParamException("failed reading text data sub-directory " + (*uit));
+	    std::string cls = dd_utils::split((*uit),'/').back();
+	    if (!test_dir)
+	      {
+		if (_ctfc->_train)
+		  {
+		    hcorresp.insert(std::pair<int,std::string>(cl,cls));
+		    hcorresp_r.insert(std::pair<std::string,int>(cls,cl));
+		  }
+	      }
+	    else
+	      {
+		std::unordered_map<std::string,int>::const_iterator hcit;
+		if ((hcit=hcorresp_r.find(cls))==hcorresp_r.end())
+		  {
+		    LOG(ERROR) << "class " << cls << " appears in testing set but not in training set, skipping";
+		    ++uit;
+		    continue;
+		  }
+		cl = (*hcit).second;
+	      }
 	    auto fit = subdir_files.begin();
 	    while(fit!=subdir_files.end()) // XXX: re-iterating the file is not optimal
 	      {
 		lfiles.push_back(std::pair<std::string,int>((*fit),cl));
 		++fit;
 	      }
-	    ++cl;
+	    if (!test_dir)
+	      ++cl;
 	    ++uit;
 	  }
       }
@@ -112,23 +158,26 @@ namespace dd
 	std::stringstream buffer;
 	buffer << txt_file.rdbuf();
 	std::string ct = buffer.str();
-	_ctfc->parse_content(ct,p.second);
+	_ctfc->parse_content(ct,p.second,test_dir);
       }
 
     // post-processing
     size_t initial_vocab_size = _ctfc->_vocab.size();
-    auto vhit = _ctfc->_vocab.begin();
-    while(vhit!=_ctfc->_vocab.end())
+    if (_ctfc->_train && !test_dir)
       {
-	if ((*vhit).second._total_count < _ctfc->_min_count)
-	  vhit = _ctfc->_vocab.erase(vhit);
-	else ++vhit;
+	auto vhit = _ctfc->_vocab.begin();
+	while(vhit!=_ctfc->_vocab.end())
+	  {
+	    if ((*vhit).second._total_count < _ctfc->_min_count)
+	      vhit = _ctfc->_vocab.erase(vhit);
+	    else ++vhit;
+	  }
       }
-    if (initial_vocab_size != _ctfc->_vocab.size())
+    if (_ctfc->_train && !test_dir && initial_vocab_size != _ctfc->_vocab.size())
       {
 	// update pos
 	int pos = 0;
-	vhit = _ctfc->_vocab.begin();
+	auto vhit = _ctfc->_vocab.begin();
 	while(vhit!=_ctfc->_vocab.end())
 	  {
 	    (*vhit).second._pos = pos;
@@ -137,7 +186,7 @@ namespace dd
 	  }
       }
 
-    if (!_ctfc->_characters && (initial_vocab_size != _ctfc->_vocab.size() || _ctfc->_tfidf))
+    if (!_ctfc->_characters && !test_dir && (initial_vocab_size != _ctfc->_vocab.size() || _ctfc->_tfidf))
       {
 	// clearing up the corpus + tfidf
 	std::unordered_map<std::string,Word>::iterator whit;
@@ -167,7 +216,7 @@ namespace dd
       }
 
     // write corresp file
-    if (_ctfc->_train)
+    if (_ctfc->_train && !test_dir)
       {
 	std::ofstream correspf(_ctfc->_model_repo + "/" + _ctfc->_correspname,std::ios::binary);
 	auto hit = hcorresp.begin();
@@ -186,7 +235,8 @@ namespace dd
   
   /*- TxtInputFileConn -*/
   void TxtInputFileConn::parse_content(const std::string &content,
-				       const float &target)
+				       const float &target,
+				       const bool &test)
   {
     if (!_train && content.empty())
       throw InputConnectorBadParamException("no text data found");
@@ -237,14 +287,20 @@ namespace dd
 		  }
 		tbe->add_word(w,1.0,_count);
 	      }
-	    _txt.push_back(tbe);
+	    if (!test)
+	      _txt.push_back(tbe);
+	    else _test_txt.push_back(tbe);
 	  }
 	else // character-level features
 	  {
+	    if (_seq_forward)
+	      std::reverse(ct.begin(),ct.end());
 	    TxtCharEntry *tce = new TxtCharEntry(target);
 	    std::unordered_map<uint32_t,int>::const_iterator whit;
 	    boost::char_separator<char> sep("\n\t\f\r");
 	    boost::tokenizer<boost::char_separator<char>> tokens(ct,sep);
+	    int seq = 0;
+	    bool prev_space = false;
 	    for (std::string w: tokens)
 	      {
 		char *str = (char*)w.c_str();
@@ -266,12 +322,27 @@ namespace dd
 		  if (c == 0)
 		    continue;
 		  if ((whit=_alphabet.find(c))==_alphabet.end())
-		    tce->add_char(' ');
-		  else tce->add_char(c);
+		    {
+		      if (!prev_space)
+			{
+			  tce->add_char(' ');
+			  seq++;
+			  prev_space = true;
+			}
+		    }
+		  else 
+		    {
+		      tce->add_char(c);
+		      seq++;
+		      prev_space = false;
+		    }
 		}
-		while(str_i<end);
+		while(str_i<end && seq < _sequence);
 	      }
-	    _txt.push_back(tce);
+	    if (!test)
+	      _txt.push_back(tce);
+	    else _test_txt.push_back(tce);
+	    std::cerr << "\rloaded text samples=" << _txt.size();
 	  }
 
       }
@@ -289,13 +360,18 @@ namespace dd
       {
 	out << p.first << delim << p.second._pos << std::endl;
       }
+    out.close();
   }
 
-  void TxtInputFileConn::deserialize_vocab()
+  void TxtInputFileConn::deserialize_vocab(const bool &required)
   {
     std::string vocabfname = _model_repo + "/" + _vocabfname;
     if (!fileops::file_exists(vocabfname))
-      throw InputConnectorBadParamException("cannot find vocabulary file " + vocabfname);
+      {
+	if (required)
+	  throw InputConnectorBadParamException("cannot find vocabulary file " + vocabfname);
+	else return;
+      }
     std::ifstream in;
     in.open(vocabfname);
     if (!in.is_open())
@@ -305,7 +381,7 @@ namespace dd
       {
 	std::vector<std::string> tokens = dd_utils::split(line,',');
 	std::string key = tokens.at(0);
-	int pos = atoi(tokens.at(1).c_str());
+	int pos = std::atoi(tokens.at(1).c_str());
 	_vocab.emplace(std::make_pair(key,Word(pos)));
       }
     std::cerr << "loaded vocabulary of size=" << _vocab.size() << std::endl;

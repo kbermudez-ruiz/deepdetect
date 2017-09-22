@@ -111,6 +111,9 @@ namespace dd
      */
     void init(const APIData &ad)
     {
+      this->_inputc._model_repo = ad.getobj("model").get("repository").get<std::string>();
+      if (this->_inputc._model_repo.empty())
+	throw MLLibBadParamException("empty repository");
       this->_inputc.init(ad.getobj("parameters").getobj("input"));
       this->_outputc.init(ad.getobj("parameters").getobj("output"));
       this->init_mllib(ad.getobj("parameters").getobj("mllib"));
@@ -195,8 +198,7 @@ namespace dd
     {
       APIData jmrepo;
       jmrepo.add("repository",this->_mlmodel._repo);
-      std::vector<APIData> vobj = {jmrepo};
-      out.add("model",vobj);
+      out.add("model",jmrepo);
       if (!ad.has("async") || (ad.has("async") && ad.get("async").get<bool>()))
 	{
 	  std::lock_guard<std::mutex> lock(_tjobs_mutex);
@@ -282,6 +284,9 @@ namespace dd
 		out.add("status","finished");
 	      else out.add("status","unknown error");
 	      //this->collect_measures(out); // XXX: beware if there was a queue, since the job has finished, there might be a new one running.
+	      APIData jmrepo;
+	      jmrepo.add("repository",this->_mlmodel._repo);
+	      out.add("model",jmrepo);
 	      std::chrono::time_point<std::chrono::system_clock> trun = std::chrono::system_clock::now();
 	      out.add("time",std::chrono::duration_cast<std::chrono::seconds>(trun-(*hit).second._tstart).count());
 	      if (ad_params_out.has("measure_hist") && ad_params_out.get("measure_hist").get<bool>())
@@ -344,7 +349,16 @@ namespace dd
 	{
 	  if (!_train_mutex.try_lock_shared())
 	    throw MLServiceLockException("Predict call while training with an offline learning algorithm");
-	  int err = this->predict(ad,out);
+	  int err = 0;
+	  try
+	    {
+	      err = this->predict(ad,out);
+	    }
+	  catch(std::exception &e)
+	    {
+	      _train_mutex.unlock_shared();
+	      throw;
+	    }
 	  _train_mutex.unlock_shared();
 	  return err;
 	}

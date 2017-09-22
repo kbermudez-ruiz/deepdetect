@@ -20,8 +20,10 @@
  */
 
 #include "caffemodel.h"
+#include "mllibstrategy.h"
 #include "utils/fileops.hpp"
 #include <glog/logging.h>
+#include <exception>
 #include <fstream>
 #include <iostream>
 
@@ -33,19 +35,22 @@ namespace dd
     if (ad.has("templates"))
       this->_mlmodel_template_repo = ad.get("templates").get<std::string>();
     else this->_mlmodel_template_repo += "caffe/"; // default
+
+    if (ad.has("def"))
+      _def = ad.get("def").get<std::string>();
+    if (ad.has("trainf"))
+      _trainf = ad.get("trainf").get<std::string>();
+    if (ad.has("weights"))
+      _weights = ad.get("weights").get<std::string>();
+    if (ad.has("corresp"))
+      _corresp = ad.get("corresp").get<std::string>();
+    if (ad.has("solver"))
+      _solver = ad.get("solver").get<std::string>();
     if (ad.has("repository"))
       {
-	read_from_repository(ad.get("repository").get<std::string>()); // XXX: beware, error not caught
+       	if (read_from_repository(ad.get("repository").get<std::string>()))
+	  throw MLLibBadParamException("error reading or listing Caffe models in repository " + _repo);
       }
-    else
-      {
-	_def = ad.get("def").get<std::string>();
-	_trainf = ad.get("trainf").get<std::string>();
-	_weights = ad.get("weights").get<std::string>();
-	_corresp = ad.get("corresp").get<std::string>();
-	_solver = ad.get("solver").get<std::string>();
-      }
-
     read_corresp_file();
   }
   
@@ -56,7 +61,8 @@ namespace dd
     static std::string weights = ".caffemodel";
     static std::string sstate = ".solverstate";
     static std::string corresp = "corresp";
-    static std::string solver = "solver";
+    static std::string solver = "_solver.prototxt";
+    static std::string meanf = "mean.binaryproto";
     this->_repo = repo;
     std::unordered_set<std::string> lfiles;
     int e = fileops::list_directory(repo,true,false,lfiles);
@@ -70,7 +76,11 @@ namespace dd
     auto hit = lfiles.begin();
     while(hit!=lfiles.end())
       {
-	if ((*hit).find(sstate)!=std::string::npos)
+	if ((*hit).find( meanf)!=std::string::npos)
+	  {
+	    _has_mean_file = true;
+	  }
+	else if ((*hit).find(sstate)!=std::string::npos)
 	  {
 	    // stat file to pick the latest one
 	    long int st = fileops::file_last_modif((*hit));
@@ -106,12 +116,18 @@ namespace dd
 	  trainf = (*hit);
 	++hit;
       }
-    _def = deployf;
-    _trainf = trainf;
-    _weights = weightsf;
-    _corresp = correspf;
-    _solver = solverf;
-    _sstate = sstatef;
+    if (_def.empty())
+      _def = deployf;
+    if (_trainf.empty())
+      _trainf = trainf;
+    if (_weights.empty())
+      _weights = weightsf;
+    if (_corresp.empty())
+      _corresp = correspf;
+    if (_solver.empty())
+      _solver = solverf;
+    if (_sstate.empty())
+      _sstate = sstatef;
     
     /*    if (deployf.empty() || weightsf.empty())
       {
@@ -120,29 +136,4 @@ namespace dd
 	}*/
     return 0;
   }
-
-  int CaffeModel::read_corresp_file()
-  {
-    if (!_corresp.empty()) //TODO: test for supervised.
-      {
-	std::ifstream ff(_corresp);
-	if (!ff.is_open())
-	  LOG(ERROR) << "cannot open Caffe model corresp file=" << _corresp << std::endl;
-	else{
-	  std::string line;
-	  while(!ff.eof())
-	    {
-	      std::getline(ff,line);
-	      std::string key = line.substr(0,line.find(' '));
-	      if (!key.empty())
-		{
-		  std::string value = line.substr(line.find(' ')+1);
-		  _hcorresp.insert(std::pair<int,std::string>(std::stoi(key),value));
-		}
-	    }
-	}
-      }
-    return 0;
-  }
-
 }

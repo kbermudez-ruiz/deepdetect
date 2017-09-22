@@ -20,7 +20,7 @@
  */
 
 /**
- * This code is adapted from Caffe's convert_imageset tool
+ * Part of this code is adapted from Caffe's convert_imageset tool
  */
 
 #include "caffeinputconns.h"
@@ -33,10 +33,58 @@ using namespace caffe;
 namespace dd
 {
   
+  void CaffeInputInterface::write_class_weights(const std::string &model_repo,
+						const APIData &ad_mllib)
+  {
+    std::string cl_file = model_repo + "/class_weights.binaryproto";
+    if (ad_mllib.has("class_weights"))
+      {
+	std::vector<double> cw;
+	try
+	  {
+	    cw = ad_mllib.get("class_weights").get<std::vector<double>>();
+	  }
+	catch (std::exception &e)
+	  {
+	    // let's try array of int, that's a common mistake
+	    std::vector<int> cwi = ad_mllib.get("class_weights").get<std::vector<int>>();
+	    for (int v: cwi)
+	      cw.push_back(static_cast<double>(v));
+	  }
+	int nclasses = cw.size();
+	BlobProto cw_blob;
+	cw_blob.set_num(1);
+	cw_blob.set_channels(1);
+	cw_blob.set_height(nclasses);
+	cw_blob.set_width(nclasses);
+	for (int i=0;i<nclasses;i++)
+	  {
+	    for (int j=0;j<nclasses;j++)
+	      {
+		if (i == j)
+		  cw_blob.add_data(cw.at(i));
+		else cw_blob.add_data(0.);
+	      }
+	  }
+	LOG(INFO) << "Write class weights to " << cl_file;
+	WriteProtoToBinaryFile(cw_blob,cl_file.c_str());
+      }
+  }
+
+  std::string ImgCaffeInputFileConn::guess_encoding(const std::string &file)
+  {
+    size_t p = file.rfind('.');
+    if (p == file.npos)
+      LOG(WARNING) << "Failed to guess the encoding of " << file;
+    std::string enc = file.substr(p);
+    std::transform(enc.begin(),enc.end(),enc.begin(),::tolower);
+    return enc;
+  }
+  
   // convert images into db entries
   // a root folder must contain directories as classes holding image
   // files for each class. The name of the class is the name of the directory.
-  int ImgCaffeInputFileConn::images_to_db(const std::string &rfolder,
+  int ImgCaffeInputFileConn::images_to_db(const std::vector<std::string> &rfolders,
 					  const std::string &traindbname,
 					  const std::string &testdbname,
 					  const std::string &backend,
@@ -49,56 +97,43 @@ namespace dd
     // test whether the train / test dbs are already in
     // since they may be long to build, we pass on them if there already
     // in the model repository.
-    // however, some generic values need to be acquired, and since Caffe does not
-    // provide a db size operator, we iterate and count elements.
     if (fileops::file_exists(dbfullname))
       {
-	LOG(WARNING) << "image db file " << dbfullname << " already exists, bypassing creation but checking on records, may take a while...\n";
+	LOG(WARNING) << "image db file " << dbfullname << " already exists, bypassing creation but checking on records";
 	std::unique_ptr<db::DB> db(db::GetDB(backend));
 	db->Open(dbfullname.c_str(), db::READ);
-	std::unique_ptr<db::Cursor> cursor(db->NewCursor());
-	_db_batchsize = 0;
-	while(cursor->valid())
-	  {
-	    ++_db_batchsize;
-	    cursor->Next();
-	  }
-	LOG(WARNING) << "image db file " << dbfullname << " with " << _db_batchsize << " records\n";
+	_db_batchsize = db->Count();
+	LOG(WARNING) << "image db file " << dbfullname << " with " << _db_batchsize << " records";
 	if (!testdbname.empty() && fileops::file_exists(testdbfullname))
 	  {
-	    LOG(WARNING) << "image db file " << testdbfullname << " already exists, bypassing creation but checking on records, may take a while...\n";
+	    LOG(WARNING) << "image db file " << testdbfullname << " already exists, bypassing creation but checking on records";
 	    std::unique_ptr<db::DB> tdb(db::GetDB(backend));
 	    tdb->Open(testdbfullname.c_str(), db::READ);
-	    std::unique_ptr<db::Cursor> tcursor(tdb->NewCursor());
-	    _db_testbatchsize = 0;
-	    while(tcursor->valid())
-	      {
-		Datum datum;
-		datum.ParseFromString(tcursor->value());
-		++_db_testbatchsize;
-		tcursor->Next();
-	      }
-	    LOG(WARNING) << "image db file " << testdbfullname << " with " << _db_testbatchsize << " records\n";
+	    _db_testbatchsize = tdb->Count();
+	    LOG(WARNING) << "image db file " << testdbfullname << " with " << _db_testbatchsize << " records";
 	  }
 	return 0;
       }
 
-    // list directories in dataset root folder
+    // list directories in dataset train folder
     std::unordered_set<std::string> subdirs;
-    if (fileops::list_directory(rfolder,false,true,subdirs))
-      throw InputConnectorBadParamException("failed reading image data directory " + rfolder);
+    if (fileops::list_directory(rfolders.at(0),false,true,subdirs))
+      throw InputConnectorBadParamException("failed reading image train data directory " + rfolders.at(0));
 
     // list files and classes, possibly shuffle / split them
     int cl = 0;
     std::unordered_map<int,std::string> hcorresp; // correspondence class number / class name
+    std::unordered_map<std::string,int> hcorresp_r; // reverse correspondence for test set.
     std::vector<std::pair<std::string,int>> lfiles; // labeled files
     auto uit = subdirs.begin();
     while(uit!=subdirs.end())
       {
 	std::unordered_set<std::string> subdir_files;
 	if (fileops::list_directory((*uit),true,false,subdir_files))
-	  throw InputConnectorBadParamException("failed reading image data sub-directory " + (*uit));
-	hcorresp.insert(std::pair<int,std::string>(cl,dd_utils::split((*uit),'/').back()));
+	  throw InputConnectorBadParamException("failed reading image train data sub-directory " + (*uit));
+	std::string cls = dd_utils::split((*uit),'/').back();
+	hcorresp.insert(std::pair<int,std::string>(cl,cls));
+	hcorresp_r.insert(std::pair<std::string,int>(cls,cl));
 	auto fit = subdir_files.begin();
 	while(fit!=subdir_files.end()) // XXX: re-iterating the file is not optimal
 	  {
@@ -141,6 +176,38 @@ namespace dd
 	    ++chit;
 	  }
 	lfiles.erase(dchit,lfiles.end());
+      }
+    else if (rfolders.size() > 1)
+      {
+	// list directories in dataset test folder
+	std::unordered_set<std::string> test_subdirs;
+	if (fileops::list_directory(rfolders.at(1),false,true,test_subdirs))
+	  throw InputConnectorBadParamException("failed reading image test data directory " + rfolders.at(1));
+
+	// list files and classes, possibly shuffle / split them
+	std::unordered_map<std::string,int>::const_iterator hcit;
+	auto uit = test_subdirs.begin();
+	while(uit!=test_subdirs.end())
+	  {
+	    std::unordered_set<std::string> subdir_files;
+	    if (fileops::list_directory((*uit),true,false,subdir_files))
+	      throw InputConnectorBadParamException("failed reading image test data sub-directory " + (*uit));
+	    std::string cls = dd_utils::split((*uit),'/').back();
+	    if ((hcit=hcorresp_r.find(cls))==hcorresp_r.end())
+	      {
+		LOG(ERROR) << "class " << cls << " appears in testing set but not in training set, skipping";
+		++uit;
+		continue;
+	      }
+	    int cl = (*hcit).second;
+	    auto fit = subdir_files.begin();
+	    while(fit!=subdir_files.end()) // XXX: re-iterating the file is not optimal
+	      {
+		test_lfiles.push_back(std::pair<std::string,int>((*fit),cl));
+		++fit;
+	      }
+	    ++uit;
+	  }	
       }
     _db_batchsize = lfiles.size();
     _db_testbatchsize = test_lfiles.size();
@@ -188,13 +255,7 @@ namespace dd
       bool status;
       std::string enc = encode_type;
       if (encoded && !enc.size()) {
-	// Guess the encoding type from the file name
-	std::string fn = lfiles[line_id].first;
-	size_t p = fn.rfind('.');
-	if ( p == fn.npos )
-	  LOG(WARNING) << "Failed to guess the encoding of '" << fn << "'";
-	enc = fn.substr(p);
-	std::transform(enc.begin(), enc.end(), enc.begin(), ::tolower);
+	enc = guess_encoding(lfiles[line_id].first);
       }
       status = ReadImageToDatum(lfiles[line_id].first,
 				lfiles[line_id].second, _height, _width, !_bw,
@@ -232,7 +293,20 @@ namespace dd
     std::string dbfullname = dbname + "." + backend;
     if (fileops::file_exists(meanfile))
       {
-	LOG(WARNING) << "image mean file " << meanfile << " already exists, bypassing creation\n";
+	LOG(WARNING) << "image mean file " << meanfile << " already exists, bypassing creation";
+	BlobProto sum_blob;
+	ReadProtoFromBinaryFile(meanfile.c_str(),&sum_blob);
+	const int channels = sum_blob.channels();
+	const int dim = sum_blob.height() * sum_blob.width();
+	_mean_values = std::vector<float>(channels,0.0);
+	LOG(INFO) << "Number of channels: " << channels;
+	for (int c = 0; c < channels; ++c) {
+	  for (int i = 0; i < dim; ++i) {
+	    _mean_values[c] += sum_blob.data(dim * c + i);
+	  }
+	  LOG(INFO) << "mean_value channel [" << c << "]:" << _mean_values[c] / dim;
+	  _mean_values[c] /= dim;
+	}
 	return 0;
       }
 
@@ -293,32 +367,38 @@ namespace dd
     // Write to disk
     LOG(INFO) << "Write to " << meanfile;
     WriteProtoToBinaryFile(sum_blob, meanfile.c_str());
-    
+
+    // let's store the simpler mean values in case of image
+    // size changes, e.g. cropping
     const int channels = sum_blob.channels();
     const int dim = sum_blob.height() * sum_blob.width();
-    std::vector<float> mean_values(channels, 0.0);
+    _mean_values = std::vector<float>(channels,0.0);
     LOG(INFO) << "Number of channels: " << channels;
     for (int c = 0; c < channels; ++c) {
       for (int i = 0; i < dim; ++i) {
-	mean_values[c] += sum_blob.data(dim * c + i);
+	_mean_values[c] += sum_blob.data(dim * c + i);
       }
-      LOG(INFO) << "mean_value channel [" << c << "]:" << mean_values[c] / dim;
+      LOG(INFO) << "mean_value channel [" << c << "]:" << _mean_values[c] / dim;
+      _mean_values[c] /= dim;
     }
     return 0;
   }
 
-  std::vector<caffe::Datum> ImgCaffeInputFileConn::get_dv_test(const int &num,
+  std::vector<caffe::Datum> ImgCaffeInputFileConn::get_dv_test_db(const int &num,
 							       const bool &has_mean_file)
   {
     static Blob<float> data_mean;
     static float *mean = nullptr;
+    int tnum = num;
+    if (tnum == 0)
+      tnum = -1;
     if (!_test_db_cursor)
       {
 	// open db and create cursor
 	if (!_test_db)
 	  {
 	    _test_db = std::unique_ptr<db::DB>(db::GetDB("lmdb"));
-	    _test_db->Open(_model_repo + "/" + _test_dbfullname.c_str(),db::READ);
+	    _test_db->Open(_test_dbfullname.c_str(),db::READ);
 	  }
 	_test_db_cursor = std::unique_ptr<db::Cursor>(_test_db->NewCursor());
 	
@@ -337,7 +417,7 @@ namespace dd
     while(_test_db_cursor->valid())
       {
 	// fill up a vector up to 'num' elements.
-	if (i == num)
+	if (i == tnum)
 	  break;
 	Datum datum;
 	datum.ParseFromString(_test_db_cursor->value());
@@ -361,16 +441,70 @@ namespace dd
 	    datum.clear_data();
 	  }
 	dv.push_back(datum);
+	_ids.push_back(_test_db_cursor->key());
 	_test_db_cursor->Next();
 	++i;
       }
     return dv;
   }
+
+  std::vector<caffe::Datum> ImgCaffeInputFileConn::get_dv_test_segmentation(const int &num,
+									    const bool &has_mean_file)
+  {
+    (void) has_mean_file;
+    if (_segmentation_data_lines.empty())
+      {
+	LOG(INFO) << "reading segmentation test file " << _uris.at(1).c_str();
+	std::ifstream infile(_uris.at(1).c_str());
+	std::string filename, label_filename;
+	while(infile >> filename >> label_filename)
+	  {
+	    _segmentation_data_lines.push_back(std::make_pair(filename,label_filename));
+	  }
+      }
+
+    std::vector<caffe::Datum> dv;
+    int j = 0;
+    for (int i=_dt_seg;i<static_cast<int>(_segmentation_data_lines.size());i++)
+      {
+	if (j == num)
+	  break;
+	std::string enc = guess_encoding(_segmentation_data_lines[i].first);
+	Datum datum_data, datum_labels;
+	bool status = ReadImageToDatum(_segmentation_data_lines[i].first,-1,
+				       _height,_width,0,0,!_bw,false,enc,&datum_data);
+	if (status == false)
+	  {
+	    LOG(ERROR) << "reading segmentation image " << _segmentation_data_lines[i].first << " to datum";
+	    continue;
+	  }
+
+	cv::Mat cv_lab = ReadImageToCVMat(_segmentation_data_lines[i].second,_height,_width,false,true);
+	datum_labels.set_height(_height);
+	datum_labels.set_width(_width);
+	datum_labels.set_channels(1);
+	for (int j=0;j<cv_lab.rows;j++) // height
+	  {
+	    for (int i=0;i<cv_lab.cols;i++) // width
+	      {
+		datum_labels.add_float_data(static_cast<float>(cv_lab.at<uchar>(j,i)));
+	      }
+	  }
+	dv.push_back(datum_data);
+	dv.push_back(datum_labels);
+	_ids.push_back(std::to_string(j));
+	++j;
+      }
+    _dt_seg += j;
+    return dv;
+  }
   
   void ImgCaffeInputFileConn::reset_dv_test()
   {
+    _dt_vit = _dv_test.begin();
     _test_db_cursor = std::unique_ptr<caffe::db::Cursor>();
     _test_db = std::unique_ptr<caffe::db::DB>();
+    _dt_seg = 0;
   }
 
 
@@ -383,6 +517,12 @@ namespace dd
 	return 0;
       }
     else return -1;
+  }
+
+  int DDCCsv::read_db(const std::string &fname)
+  {
+    _cifc->_db_fname = fname;
+    return 0;
   }
   
   int DDCCsv::read_mem(const std::string &content)
@@ -413,15 +553,12 @@ namespace dd
     // test whether the train / test dbs are already in
     // since they may be long to build, we pass on them if there already
     // in the model repository.
-    // however, some generic values need to be acquired, and since Caffe does not
-    // provide a db size operator, we iterate and count elements.
     if (fileops::file_exists(dbfullname))
       {
-	LOG(WARNING) << "CSV db file " << dbfullname << " already exists, bypassing creation but checking on records, may take a while...\n";
+	LOG(WARNING) << "CSV db file " << dbfullname << " already exists, bypassing creation but checking on records";
 	std::unique_ptr<db::DB> db(db::GetDB(backend));
 	db->Open(dbfullname.c_str(), db::READ);
 	std::unique_ptr<db::Cursor> cursor(db->NewCursor());
-	_db_batchsize = 0;
 	while(cursor->valid())
 	  {
 	    if (_channels == 0)
@@ -430,25 +567,17 @@ namespace dd
 		datum.ParseFromString(cursor->value());
 		_channels = datum.channels();
 	      }
-	    ++_db_batchsize;
-	    cursor->Next();
+	    break;
 	  }
-	LOG(INFO) << "CSV db train file " << dbfullname << " with " << _db_batchsize << " records\n";
+	_db_batchsize = db->Count();
+	LOG(INFO) << "CSV db train file " << dbfullname << " with " << _db_batchsize << " records";
 	if (!testdbname.empty() && fileops::file_exists(testdbfullname))
 	  {
-	    LOG(WARNING) << "CSV db file " << testdbfullname << " already exists, bypassing creation but checking on records, may take a while...\n";
+	    LOG(WARNING) << "CSV db file " << testdbfullname << " already exists, bypassing creation but checking on records";
 	    std::unique_ptr<db::DB> tdb(db::GetDB(backend));
 	    tdb->Open(testdbfullname.c_str(), db::READ);
-	    std::unique_ptr<db::Cursor> tcursor(tdb->NewCursor());
-	    _db_testbatchsize = 0;
-	    while(tcursor->valid())
-	      {
-		Datum datum;
-		datum.ParseFromString(tcursor->value());
-		++_db_testbatchsize;
-		tcursor->Next();
-	      }
-	    LOG(INFO) << "CSV db test file " << testdbfullname << " with " << _db_testbatchsize << " records\n";
+	    _db_testbatchsize = tdb->Count();
+	    LOG(INFO) << "CSV db test file " << testdbfullname << " with " << _db_testbatchsize << " records";
 	  }	
 	return 0;
       }
@@ -457,17 +586,7 @@ namespace dd
     _db_batchsize = 0;
     _db_testbatchsize = 0;
     write_csvline_to_db(dbfullname,testdbfullname,ad_input);
-    
-    // write corresp file
-    /*std::ofstream correspf(_model_repo + "/" + _correspname,std::ios::binary);
-    auto hit = hcorresp.begin();
-    while(hit!=hcorresp.end())
-      {
-	correspf << (*hit).first << " " << (*hit).second << std::endl;
-	++hit;
-      }
-      correspf.close();*/
-    
+        
     return 0;
   }
 
@@ -550,7 +669,7 @@ namespace dd
 						  const APIData &ad_input,
 						  const std::string &backend)
   {
-    std::cerr << "CVS line to db\n";
+    std::cerr << "CSV line to db\n";
     std::cerr << "dbfullname=" << dbfullname << std::endl;
 
     // Create new DB
@@ -587,13 +706,16 @@ namespace dd
 
   std::vector<caffe::Datum> CSVCaffeInputFileConn::get_dv_test_db(const int &num)
   {
+    int tnum = num;
+    if (tnum == 0)
+      tnum = -1;
     if (!_test_db_cursor)
       {
 	// open db and create cursor
 	if (!_test_db)
 	  {
 	    _test_db = std::unique_ptr<db::DB>(db::GetDB("lmdb"));
-	    _test_db->Open(_model_repo + "/" + _test_dbfullname.c_str(),db::READ);
+	    _test_db->Open(_test_dbfullname.c_str(),db::READ);
 	  }
 	_test_db_cursor = std::unique_ptr<db::Cursor>(_test_db->NewCursor());
       }
@@ -602,11 +724,12 @@ namespace dd
     while(_test_db_cursor->valid())
       {
 	// fill up a vector up to 'num' elements.
-	if (i == num)
+	if (i == tnum)
 	  break;
 	Datum datum;
 	datum.ParseFromString(_test_db_cursor->value());
 	dv.push_back(datum);
+	_ids.push_back(_test_db_cursor->key());
 	_test_db_cursor->Next();
 	++i;
       }
@@ -632,15 +755,12 @@ namespace dd
     // test whether the train / test dbs are already in
     // since they may be long to build, we pass on them if there already
     // in the model repository.
-    // however, some generic values need to be acquired, and since Caffe does not
-    // provide a db size operator, we iterate and count elements.
     if (fileops::file_exists(dbfullname))
       {
-	LOG(WARNING) << "Txt db file " << dbfullname << " already exists, bypassing creation but checking on records, may take a while...\n";
+	LOG(WARNING) << "Txt db file " << dbfullname << " already exists, bypassing creation but checking on records";
 	std::unique_ptr<db::DB> db(db::GetDB(backend));
 	db->Open(dbfullname.c_str(), db::READ);
 	std::unique_ptr<db::Cursor> cursor(db->NewCursor());
-	_db_batchsize = 0;
 	while(cursor->valid())
 	  {
 	    if (_channels == 0)
@@ -649,27 +769,17 @@ namespace dd
 		datum.ParseFromString(cursor->value());
 		_channels = datum.channels();
 	      }
-	    ++_db_batchsize;
-	    cursor->Next();
+	    break;
 	  }
-	LOG(INFO) << "Txt db train file " << dbfullname << " with " << _db_batchsize << " records\n";
+	_db_batchsize = db->Count();
+	LOG(INFO) << "Txt db train file " << dbfullname << " with " << _db_batchsize << " records";
 	if (!testdbname.empty() && fileops::file_exists(testdbfullname))
 	  {
-	    LOG(WARNING) << "Txt db file " << testdbfullname << " already exists, bypassing creation but checking on records, may take a while...\n";
-	    //_test_labels.clear();
+	    LOG(WARNING) << "Txt db file " << testdbfullname << " already exists, bypassing creation but checking on records";
 	    std::unique_ptr<db::DB> tdb(db::GetDB(backend));
 	    tdb->Open(testdbfullname.c_str(), db::READ);
-	    std::unique_ptr<db::Cursor> tcursor(tdb->NewCursor());
-	    _db_testbatchsize = 0;
-	    while(tcursor->valid())
-	      {
-		Datum datum;
-		datum.ParseFromString(tcursor->value());
-		//_test_labels.push_back(datum.label());
-		++_db_testbatchsize;
-		tcursor->Next();
-	      }
-	    LOG(INFO) << "Txt db test file " << testdbfullname << " with " << _db_testbatchsize << " records\n";
+	    _db_testbatchsize = tdb->Count();
+	    LOG(INFO) << "Txt db test file " << testdbfullname << " with " << _db_testbatchsize << " records";
 	  }
 	// XXX: remove in-memory data, which pre-processing is useless and should be avoided
 	destroy_txt_entries(_txt);
@@ -681,26 +791,20 @@ namespace dd
     _db_batchsize = _txt.size();
     _db_testbatchsize = _test_txt.size();
 
-    std::cerr << "db_batchsize=" << _db_batchsize << " / db_testbatchsize=" << _db_testbatchsize << std::endl;
+    LOG(INFO) << "db_batchsize=" << _db_batchsize << " / db_testbatchsize=" << _db_testbatchsize << std::endl;
     
     // write to dbs (i.e. train and possibly test)
-    write_txt_to_db(dbfullname,_txt);
+    if (!_sparse)
+      write_txt_to_db(dbfullname,_txt);
+    else write_sparse_txt_to_db(dbfullname,_txt);
     destroy_txt_entries(_txt);
     if (!_test_txt.empty())
       {
-	write_txt_to_db(testdbfullname,_test_txt);
+	if (!_sparse)
+	  write_txt_to_db(testdbfullname,_test_txt);
+	else write_sparse_txt_to_db(testdbfullname,_test_txt);
 	destroy_txt_entries(_test_txt);
       }
-    
-    // write corresp file
-    /*std::ofstream correspf(_model_repo + "/" + _correspname,std::ios::binary);
-    auto hit = hcorresp.begin();
-    while(hit!=hcorresp.end())
-      {
-	correspf << (*hit).first << " " << (*hit).second << std::endl;
-	++hit;
-      }
-      correspf.close();*/
     
     return 0;
   }
@@ -756,32 +860,312 @@ namespace dd
     db->Close();
   }
 
+  void TxtCaffeInputFileConn::write_sparse_txt_to_db(const std::string &dbfullname,
+						     std::vector<TxtEntry<double>*> &txt,
+						     const std::string &backend)
+  {
+    // Create new DB
+    std::unique_ptr<db::DB> db(db::GetDB(backend));
+    db->Open(dbfullname.c_str(), db::NEW);
+    std::unique_ptr<db::Transaction> txn(db->NewTransaction());
+
+    // Storing to db
+    SparseDatum datum;
+    int count = 0;
+    const int kMaxKeyLength = 256;
+    char key_cstr[kMaxKeyLength];
+    int n = 0;
+    auto hit = txt.begin();
+    while(hit!=txt.end())
+      {
+	/*if (_characters)
+	  datum = to_datum<TxtCharEntry>(static_cast<TxtCharEntry*>((*hit)));
+	  else*/
+	datum = to_sparse_datum(static_cast<TxtBowEntry*>((*hit)));
+	int length = snprintf(key_cstr,kMaxKeyLength,"%s",std::to_string(n).c_str());
+	
+	// put in db
+	std::string out;
+	if (!datum.SerializeToString(&out))
+	  LOG(ERROR) << "Failed serialization of datum for db storage";
+	txn->Put(string(key_cstr,length),out);
+
+	if (++count % 1000 == 0) {
+	  // commit db
+	  txn->Commit();
+	  txn.reset(db->NewTransaction());
+	  LOG(INFO) << "Processed " << count << " text entries";
+	}
+	
+	++hit;
+	++n;
+      }
+
+    // write the last batch
+    if (count % 1000 != 0) {
+      txn->Commit();
+      LOG(INFO) << "Processed " << count << " text entries";
+    }
+
+    db->Close();
+  }
+
   std::vector<caffe::Datum> TxtCaffeInputFileConn::get_dv_test_db(const int &num)
   {
+    int tnum = num;
+    if (tnum == 0)
+      tnum = -1;
     if (!_test_db_cursor)
       {
 	// open db and create cursor
 	if (!_test_db)
 	  {
 	    _test_db = std::unique_ptr<db::DB>(db::GetDB("lmdb"));
-	    _test_db->Open(_model_repo + "/" + _test_dbfullname.c_str(),db::READ);
+	    _test_db->Open(_test_dbfullname.c_str(),db::READ);
 	  }
 	_test_db_cursor = std::unique_ptr<db::Cursor>(_test_db->NewCursor());
       }
-    std::vector<caffe::Datum> dv;
     int i =0;
+    std::vector<caffe::Datum> dv;
     while(_test_db_cursor->valid())
       {
 	// fill up a vector up to 'num' elements.
-	if (i == num)
+	if (i == tnum)
 	  break;
 	Datum datum;
 	datum.ParseFromString(_test_db_cursor->value());
 	dv.push_back(datum);
+	_ids.push_back(_test_db_cursor->key());
 	_test_db_cursor->Next();
 	++i;
       }
     return dv;
   }
+   
+  std::vector<caffe::SparseDatum> TxtCaffeInputFileConn::get_dv_test_sparse_db(const int &num)
+  {
+    int tnum = num;
+    if (tnum == 0)
+      tnum = -1;
+    if (!_test_db_cursor)
+      {
+	// open db and create cursor
+	if (!_test_db)
+	  {
+	    _test_db = std::unique_ptr<db::DB>(db::GetDB("lmdb"));
+	    _test_db->Open(_test_dbfullname.c_str(),db::READ);
+	  }
+	_test_db_cursor = std::unique_ptr<db::Cursor>(_test_db->NewCursor());
+      }
+    int i =0;
+    std::vector<caffe::SparseDatum> dv;
+    while(_test_db_cursor->valid())
+      {
+	// fill up a vector up to 'num' elements.
+	if (i == tnum)
+	  break;
+	SparseDatum datum;
+	datum.ParseFromString(_test_db_cursor->value());
+	dv.push_back(datum);
+	_ids.push_back(_test_db_cursor->key());
+	_test_db_cursor->Next();
+	++i;
+      }
+    return dv;
+  }
+
+  /*- SVMCaffeInputFileConn -*/
+  int SVMCaffeInputFileConn::svm_to_db(const std::string &traindbname,
+				       const std::string &testdbname,
+				       const APIData &ad_input,
+				       const std::string &backend)
+  {
+    std::string dbfullname = traindbname + "." + backend;
+    std::string testdbfullname = testdbname + "." + backend;
+
+    // test whether the train / test dbs are already in
+    // since they may be long to build, we pass on them if there already
+    // in the model repository.
+    if (fileops::file_exists(dbfullname))
+      {
+	LOG(WARNING) << "SVM db file " << dbfullname << " already exists, bypassing creation but checking on records";
+	std::unique_ptr<db::DB> db(db::GetDB(backend));
+	db->Open(dbfullname.c_str(), db::READ);
+	std::unique_ptr<db::Cursor> cursor(db->NewCursor());
+	while(cursor->valid())
+	  {
+	    if (_channels == 0)
+	      {
+		SparseDatum datum;
+		datum.ParseFromString(cursor->value());
+		_channels = datum.size();
+	      }
+	    break;
+	  }
+	_db_batchsize = db->Count();
+	LOG(INFO) << "SVM db train file " << dbfullname << " with " << _db_batchsize << " records";
+	if (!testdbname.empty() && fileops::file_exists(testdbfullname))
+	  {
+	    LOG(WARNING) << "SVM db file " << testdbfullname << " already exists, bypassing creation but checking on records";
+	    std::unique_ptr<db::DB> tdb(db::GetDB(backend));
+	    tdb->Open(testdbfullname.c_str(), db::READ);
+	    _db_testbatchsize = tdb->Count();
+	    LOG(INFO) << "SVM db test file " << testdbfullname << " with " << _db_testbatchsize << " records";
+	  }	
+	return 0;
+      }
+    
+    // write files to dbs (i.e. train and possibly test)
+    _db_batchsize = 0;
+    _db_testbatchsize = 0;
+    write_svmline_to_db(dbfullname,testdbfullname,ad_input);
+    
+    return 0;
+  }
+
+  void SVMCaffeInputFileConn::add_train_svmline(const int &label,
+						const std::unordered_map<int,double> &vals,
+						const int &count)
+  {
+    if (!_db)
+      {
+	SVMInputFileConn::add_train_svmline(label,vals,count);
+	return;
+      }
+
+    const int kMaxKeyLength = 256;
+    char key_cstr[kMaxKeyLength];
+    
+    SparseDatum d = to_sparse_datum(SVMline(label,vals));
+    
+    // sequential
+    int length = snprintf(key_cstr,kMaxKeyLength,"%s",std::to_string(count).c_str()); // XXX: using appeared to confuse the training (maybe because sorted)
+    
+    // put in db
+    std::string out;
+    if(!d.SerializeToString(&out))
+      {
+	LOG(INFO) << "Failed serialization of datum for db storage";
+	return;
+      }
+    _txn->Put(std::string(key_cstr, length), out);
+    _db_batchsize++;
+    
+    if (count % 10000 == 0) {
+      // commit db
+      _txn->Commit();
+      _txn.reset(_tdb->NewTransaction());
+      LOG(INFO) << "Processed " << count << " records";
+    }
+  }
+
+  void SVMCaffeInputFileConn::add_test_svmline(const int &label,
+					       const std::unordered_map<int,double> &vals,
+					       const int &count)
+  {
+    if (!_db)
+      {
+	SVMInputFileConn::add_test_svmline(label,vals,count);
+	return;
+      }
+
+    const int kMaxKeyLength = 256;
+    char key_cstr[kMaxKeyLength];
+    
+    SparseDatum d = to_sparse_datum(SVMline(label,vals));
+    
+    // sequential
+    int length = snprintf(key_cstr,kMaxKeyLength,"%s",std::to_string(count).c_str()); // XXX: using id appeared to confuse the training (maybe because sorted)
+    
+    // put in db
+    std::string out;
+    if(!d.SerializeToString(&out))
+      {
+	LOG(INFO) << "Failed serialization of datum for db storage";
+	return;
+      }
+    _ttxn->Put(std::string(key_cstr, length), out);
+    _db_testbatchsize++;
+
+    if (count % 10000 == 0) {
+      // commit db
+      _ttxn->Commit();
+      _ttxn.reset(_ttdb->NewTransaction());
+      LOG(INFO) << "Processed " << count << " records";
+    }
+  }
   
+  void SVMCaffeInputFileConn::write_svmline_to_db(const std::string &dbfullname,
+						  const std::string &testdbfullname,
+						  const APIData &ad_input,
+						  const std::string &backend)
+  {
+    LOG(INFO) << "SVM line to db / " << "dbfullname=" << dbfullname;
+
+    // Create new DB
+    _tdb = std::unique_ptr<db::DB>(db::GetDB(backend));
+    _tdb->Open(dbfullname.c_str(), db::NEW);
+    _txn = std::unique_ptr<db::Transaction>(_tdb->NewTransaction());
+    _ttdb = std::unique_ptr<db::DB>(db::GetDB(backend));
+    _ttdb->Open(testdbfullname.c_str(), db::NEW);
+    _ttxn = std::unique_ptr<db::Transaction>(_ttdb->NewTransaction());
+    LOG(INFO) << "dbs " << dbfullname << " / " << testdbfullname << " opened";
+
+    _svm_fname = _uris.at(0); // training only from file
+    if (!fileops::file_exists(_svm_fname))
+      throw InputConnectorBadParamException("training SVM file " + _svm_fname + " does not exist");
+    if (_uris.size() > 1)
+      _svm_test_fname = _uris.at(1);
+
+    DataEl<DDSvm> ddsvm;
+    ddsvm._ctype._cifc = this;
+    ddsvm._ctype._adconf = ad_input;
+    ddsvm.read_element(_svm_fname);
+
+    _txn->Commit();
+    _ttxn->Commit();
+    
+    _tdb->Close();
+    _ttdb->Close();
+  }
+
+  std::vector<caffe::SparseDatum> SVMCaffeInputFileConn::get_dv_test_sparse_db(const int &num)
+  {
+    int tnum = num;
+    if (tnum == 0)
+      tnum = -1;
+    if (!_test_db_cursor)
+      {
+	// open db and create cursor
+	if (!_test_db)
+	  {
+	    _test_db = std::unique_ptr<db::DB>(db::GetDB("lmdb"));
+	    _test_db->Open(_test_dbfullname.c_str(),db::READ);
+	  }
+	_test_db_cursor = std::unique_ptr<db::Cursor>(_test_db->NewCursor());
+      }
+    std::vector<caffe::SparseDatum> dv;
+    int i =0;
+    while(_test_db_cursor->valid())
+      {
+	// fill up a vector up to 'num' elements.
+	if (i == tnum)
+	  break;
+	SparseDatum datum;
+	datum.ParseFromString(_test_db_cursor->value());
+	dv.push_back(datum);
+	_ids.push_back(_test_db_cursor->key());
+	_test_db_cursor->Next();
+	++i;
+      }
+    return dv;
+  }
+
+  void SVMCaffeInputFileConn::reset_dv_test()
+  {
+    _dt_vit = _dv_test_sparse.begin();
+    _test_db_cursor = std::unique_ptr<caffe::db::Cursor>();
+    _test_db = std::unique_ptr<caffe::db::DB>();
+  }
+
 }
